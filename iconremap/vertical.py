@@ -95,13 +95,50 @@ def interpolate_field(
                 elif category == "zero_below":
                     interp_vals[below] = 0.0
                 else:  # wind
-                    interp_vals[below] = f_b
+                    # Log-law surface-layer decay below source bottom. Without this,
+                    # ICON-EU's lowest model level (~1700 m AGL) propagates its
+                    # free-troposphere wind down to the LAM PBL, producing a
+                    # spurious 70+ km/h surface wind at h=0 and a 175 km/h gust10
+                    # spike that the max-over-window accumulator carries forward.
+                    # u(z) = u(z_b) · ln((z+z0)/z0) / ln((z_b+z0)/z0), z0 = 0.1 m.
+                    # Hard-cap at ±25 m/s per component as defense against extreme
+                    # jet-stream values in the source bottom level that the log-law
+                    # alone doesn't fully tame.
+                    z0 = 0.1
+                    z_abs = np.maximum(z_b - dz_below, 0.0)
+                    log_ratio = np.log((z_abs + z0) / z0) / np.log((z_b + z0) / z0)
+                    val = f_b * np.clip(log_ratio, 0.0, 1.0)
+                    interp_vals[below] = np.sign(val) * np.minimum(np.abs(val), 25.0)
 
-            # Above source top — constant gradient (rare; near 23 km top of model)
+            # Above source top — physical extrapolation per variable category.
+            # Constant copy (legacy) leaves P unchanged from source top to LAM
+            # top, producing inconsistent (T, P) pairs that crash Sundqvist's
+            # qv/qsat. Use hydrostatic-aware decay so cells stay inside ICON's
+            # e_s lookup range. DWD opendata cuts off at ~17 km; LAM top is at
+            # 23 km, so the extrapolated zone is real and ~6 km thick.
             above = zt > zs_top
             if above.any():
                 f_t = fs[-1]
-                interp_vals[above] = f_t
+                z_above = zt[above] - zs_top   # positive distance above source top
+                if category == "pressure":
+                    if t_src_full is not None:
+                        t_top = t_src_full[t_i, -1, c]
+                    else:
+                        t_top = 215.0   # typical lower stratosphere
+                    # Hydrostatic exponential decay; H = R_d·T/g ≈ 6.3 km @ T=215K
+                    interp_vals[above] = meteo.extrapolate_pressure(f_t, t_top, z_above)
+                elif category == "qv":
+                    # Stratospheric water vapor decays with H_qv ≈ 2 km (Brewer-Dobson)
+                    interp_vals[above] = f_t * np.exp(-z_above / 2000.0)
+                elif category == "zero_below":
+                    # QC/QI/QR/QS: vanish in stratosphere
+                    interp_vals[above] = 0.0
+                elif category == "temperature":
+                    # Isothermal stratosphere (good approx for 17-23 km)
+                    interp_vals[above] = f_t
+                else:  # wind
+                    # Winds in lower stratosphere ~similar to tropopause winds
+                    interp_vals[above] = f_t
 
             # write back in descending-z (ICON-standard) order
             out[t_i, :, c] = interp_vals[::-1]

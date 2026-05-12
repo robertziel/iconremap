@@ -36,30 +36,43 @@ def remap_ic(input_nc: str, extpar_nc: str, output_nc: str, *, verbose: bool = T
             f"HSURF cell count ({hsurf_tgt.shape[0]}) does not match HHL cell count ({ncell})"
         )
 
-    # KEEP source HHL as the ACTUAL source heights (DWD ICON-EU's published HHL,
-    # whatever its reference frame). Compute TARGET z_ifc independently via SLEVE
-    # for our LAM grid. This way vertical interpolation is REAL — not identity —
-    # and extrapolation kicks in when target_z is below source's lowest level
-    # (ICON-EU's lowest atm level is ~1700m above the actual surface, so all
-    # LAM cells with HSURF < 1700m need lapse-rate extrapolation).
+    # KEEP source HHL as the ACTUAL source heights (DWD ICON-EU's published HHL).
+    # Compute TARGET z_ifc independently via SLEVE for our LAM grid. Source and
+    # target may have DIFFERENT level counts (DWD now publishes 65 atm layers / 66
+    # half-levels; LAM uses 60 / 61) — interpolation is real cross-grid mapping.
     from . import sleve
-    hhl_orig = hhl_src.copy()                          # (time, nlev_intf, cell) — DWD's HHL
-    z_ifc_target = sleve.compute_z_ifc(topo=hsurf_tgt) # (nlev_intf, cell) — our LAM SLEVE
+    hhl_orig = hhl_src.copy()                          # (time, src_nlev_intf, cell) — DWD HHL
+    z_ifc_target = sleve.compute_z_ifc(topo=hsurf_tgt) # (tgt_nlev_intf, cell) — LAM SLEVE
     if verbose:
         zsm = hhl_orig[:, -1, :].mean()
         ztm = z_ifc_target[-1, :].mean()
-        print(f"[iconremap] source HHL[bottom] mean: {zsm:.1f} m (DWD ICON-EU lowest level)")
-        print(f"[iconremap] target z_ifc[bottom] mean: {ztm:.1f} m (LAM SLEVE = HSURF)")
-        print(f"[iconremap] mean target_z below source_z by: {zsm - ztm:.1f} m → lapse-rate extrap downward")
-    # Use original DWD HHL as source heights for interpolation
-    hhl_src = hhl_orig
-    # Target heights = SLEVE z_ifc (broadcast time dim)
-    hhl_tgt = np.broadcast_to(z_ifc_target[None, :, :], hhl_orig.shape).copy()
+        print(f"[iconremap] source HHL: {hhl_orig.shape[1]} half-levels, "
+              f"top={hhl_orig[:, 0, :].mean():.1f}m, bottom={zsm:.1f}m")
+        print(f"[iconremap] target z_ifc: {z_ifc_target.shape[0]} half-levels, "
+              f"top={z_ifc_target[0, :].mean():.1f}m, bottom={ztm:.1f}m (≡ HSURF)")
+        if abs(zsm - ztm) > 50.0:
+            print(f"[iconremap]   bottom mismatch {zsm - ztm:.1f} m → some cells need extrap")
+    # Terrain-following shift on source HHL: anchor it to LAM HSURF so source
+    # and target are in the SAME AGL coordinate system. Otherwise interpolation
+    # is in absolute height and over mountains (where LAM HSURF >> DWD HSURF)
+    # asks "what's the wind at 1879 m absolute (= 10 m AGL above LAM Tatra)?"
+    # while source data only goes up to ~1307 m absolute (= 10 m AGL above DWD's
+    # smoothed Tatra) — extrapolates upward into faster free-atmosphere wind,
+    # producing physically wrong "10 m AGL" values 2× too high over orography.
+    nt = hhl_orig.shape[0]
+    ncell = hhl_orig.shape[2]
+    tgt_nlev_intf = z_ifc_target.shape[0]
     hsurf_src = hhl_orig[:, -1, :].mean(axis=0)
-    hsurf_tgt_for_dhsurf = hsurf_tgt
-    # (dhsurf reporting removed — using DWD HHL as source heights now, not shifting topo)
+    hhl_src = vert.shift_hhl_to_target_topo(hhl_orig, hsurf_src, hsurf_tgt)
+    hhl_tgt = np.broadcast_to(z_ifc_target[None, :, :], (nt, tgt_nlev_intf, ncell)).copy()
 
-    # Full-level heights (cell-centered)
+    if verbose:
+        dh = hsurf_tgt - hsurf_src
+        print(f"[iconremap] HSURF shift LAM-DWD: min/mean/max = {dh.min():+.1f} / {dh.mean():+.1f} / {dh.max():+.1f} m"
+              f"  → source HHL terrain-shifted onto LAM topography")
+
+    # Full-level heights (cell-centered) — now both in absolute height above
+    # the SAME (LAM) terrain, so interpolation effectively works in AGL.
     z_src_full = vert._full_levels_from_half(hhl_src)
     z_tgt_full = vert._full_levels_from_half(hhl_tgt)
 
@@ -102,25 +115,33 @@ def remap_ic(input_nc: str, extpar_nc: str, output_nc: str, *, verbose: bool = T
             src, z_src_full, z_tgt_full, var, **kwargs
         )
 
-    # Build output dataset
+    # Build output dataset. Source and target may have different level counts;
+    # use fresh dim names ("lev" for atm full levels, "height_4" for HHL
+    # half-levels) so we don't collide with the source's "height" / "height_bnds"
+    # which xarray pins via coords.
     if verbose:
-        print(f"[iconremap] assembling output dataset...")
+        print(f"[iconremap] assembling output dataset (src nlev={hhl_orig.shape[1]-1} → tgt nlev={tgt_nlev_intf-1})...")
     ds_out = ds.copy()
+    drop_list = list(interp_results.keys()) + ["HHL"]
+    ds_out = ds_out.drop_vars([v for v in drop_list if v in ds_out.data_vars])
 
-    # Replace atm vars
+    # Re-add atm vars on a fresh "lev" dim sized to target nlev
     for var, arr in interp_results.items():
-        if "time" in ds[var].dims:
-            ds_out[var] = (ds[var].dims, arr.astype(np.float32))
+        src_dims = ds[var].dims
+        new_dims = tuple(
+            d if d in ("time", "cell") else "lev"
+            for d in src_dims
+        )
+        if "time" in src_dims:
+            ds_out[var] = (new_dims, arr.astype(np.float32))
         else:
-            ds_out[var] = (ds[var].dims, arr.squeeze(0).astype(np.float32))
+            ds_out[var] = (new_dims, arr.squeeze(0).astype(np.float32))
 
-    # Replace HHL with TARGET z_ifc (computed via SLEVE). Atm fields have
-    # been interpolated/extrapolated onto these heights — so source HHL in
-    # IC file now == target z_ifc.
+    # HHL on its own half-level dim ("height_4") — same as the prep convention
     if "time" in ds["HHL"].dims:
-        ds_out["HHL"] = (ds["HHL"].dims, hhl_tgt.astype(np.float32))
+        ds_out["HHL"] = (("time", "height_4", "cell"), hhl_tgt.astype(np.float32))
     else:
-        ds_out["HHL"] = (ds["HHL"].dims, hhl_tgt.squeeze(0).astype(np.float32))
+        ds_out["HHL"] = (("height_4", "cell"), hhl_tgt.squeeze(0).astype(np.float32))
 
     # GEOSP — surface geopotential — required by check_variables in async_latbc.
     # Compute as HSURF * g.
